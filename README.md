@@ -128,6 +128,11 @@ pip install pandas numpy pillow
 pip install scikit-learn tqdm
 pip install timm  # 如果使用 ViT
 ```
+### 快捷安装
+```bash
+# 使用清华源安装 requirements.txt 中的所有依赖
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+```
 
 ### 硬件要求
 
