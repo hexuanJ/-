@@ -94,9 +94,24 @@ dataset/
 上述数据集train（1895张、13.5GB）、test（371张、2.5GB），数据内存占比高，传输服务器困难，给出如下特殊传输方式：
 ### SDK传输
 ```bash
-import openi
+import openi  #OpenI中python的SDK传输
 import os
-from pathlib import Path
+
+# 1. 登录到OpenI平台（需要获取访问令牌）
+token = "xxx"  # 从平台中获取token（设置）
+openi.login(token=token)  # 使用 token 登录平台
+
+# 2. 验证登录状态
+user_info = openi.whoami() # 获取当前登录用户信息
+# 3. 设置数据集仓库信息
+repo_id = "xxx/xxxx"  # 格式: 用户名/仓库名
+local_dataset_path = "xxx\\xxx\\xxx"  # 本地数据集路径
+
+# 4. 上传数据集
+    result = openi.openi_upload_file(
+        repo_id=repo_id,
+        file_or_folder_path=local_dataset_path,
+        repo_type="dataset"  # 指定为数据集类型)
 ```
 ## 🔧 环境配置
 
