@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+from torchvision.models import ResNet50_Weights
 import timm
 from einops import rearrange, repeat
 
@@ -222,6 +223,97 @@ class BNNeck(nn.Module):
         return self.bn(x)
 
 
+class ResNet50ReID(nn.Module):
+    """ResNet50-based Re-ID model with last-stride=1, GeM pooling, and BNNeck.
+
+    Implements Bag of Tricks (BoT) improvements:
+      - Last stride = 1 (keeps feature map at 14x14 instead of 7x7)
+      - GeM pooling instead of average pooling
+      - Enhanced projection layer (Linear + BN + LeakyReLU + Dropout)
+      - BNNeck before classifier
+    """
+
+    def __init__(self, num_classes=31, feat_dim=512):
+        super().__init__()
+
+        # Load pretrained ResNet50 with V2 weights (offline-available via torchvision)
+        resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+
+        # Last stride = 1 (Bag of Tricks): prevents spatial downsampling in layer4,
+        # keeping the feature map at 14x14 (for 224x224 input) instead of 7x7
+        resnet.layer4[0].downsample[0].stride = (1, 1)
+        resnet.layer4[0].conv2.stride = (1, 1)
+
+        # Split backbone layers manually (exclude avgpool and fc)
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        # GeM pooling instead of average pooling
+        self.pool = GeMPooling(p=3.0)
+
+        # Enhanced projection layer
+        self.proj = nn.Sequential(
+            nn.Linear(2048, feat_dim),
+            nn.BatchNorm1d(feat_dim),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.2)
+        )
+
+        # BNNeck: for retrieval (L2-norm) vs classification (BN) branch
+        self.bnneck = BNNeck(feat_dim)
+
+        # Classification head (bias=False is standard for metric learning classifiers)
+        self.classifier = nn.Linear(feat_dim, num_classes, bias=False)
+
+        self._init_params()
+
+    def get_backbone_parameters(self):
+        """Return backbone (pretrained) parameters for use with differential learning rates."""
+        return (list(self.conv1.parameters()) + list(self.bn1.parameters()) +
+                list(self.layer1.parameters()) + list(self.layer2.parameters()) +
+                list(self.layer3.parameters()) + list(self.layer4.parameters()))
+
+    def _init_params(self):
+        for m in self.proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        nn.init.kaiming_normal_(self.classifier.weight, mode='fan_out')
+
+    def forward_features(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        return x
+
+    def forward(self, x, labels=None, return_features=False):
+        feat_map = self.forward_features(x)        # (B, 2048, H, W)
+        feat = self.pool(feat_map)                  # (B, 2048)
+        feat = self.proj(feat)                      # (B, feat_dim)
+
+        if return_features:
+            return F.normalize(feat, p=2, dim=1)
+
+        feat_bn = self.bnneck(feat)                 # (B, feat_dim)
+        logits = self.classifier(feat_bn)           # (B, num_classes)
+        return logits, feat
+
+
 class ImprovedReIDModel(nn.Module):
     """Improved Re-ID model with pretrained backbone, GeM pooling, and BNNeck.
 
@@ -230,6 +322,8 @@ class ImprovedReIDModel(nn.Module):
       - 'convnext_base_384_in22ft1k'
       - 'vit_base_patch16_384'
       - 'tf_efficientnet_b4' (fallback for smaller GPU)
+
+    When backbone_name == 'resnet50', uses torchvision (offline-available) instead of timm.
     """
 
     def __init__(self, num_classes=31,
@@ -238,24 +332,31 @@ class ImprovedReIDModel(nn.Module):
                  pretrained=True,
                  image_size=384):
         super().__init__()
-        self.backbone = timm.create_model(
-            backbone_name, pretrained=pretrained, num_classes=0
-        )
 
-        # Determine feature dimension from backbone
-        backbone_feat_dim = self.backbone.num_features
-
-        # Use GeM pooling if backbone outputs 4-D features, otherwise flatten
-        self.use_gem = False
-        with torch.no_grad():
-            dummy = torch.zeros(2, 3, image_size, image_size)
-            out = self.backbone.forward_features(dummy)
-            if out.dim() == 4:
-                self.use_gem = True
-            elif out.dim() == 3:
-                # ViT / Swin return (B, tokens, C); take mean over tokens
-                self.use_gem = False
-            # backbone_feat_dim already set above
+        if backbone_name == 'resnet50':
+            # Use torchvision for offline-available ResNet50 weights
+            resnet = models.resnet50(
+                weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+            )
+            backbone_feat_dim = resnet.fc.in_features
+            resnet.fc = nn.Identity()
+            resnet.avgpool = nn.Identity()
+            self.backbone = resnet
+            self.use_gem = True
+        else:
+            self.backbone = timm.create_model(
+                backbone_name, pretrained=pretrained, num_classes=0
+            )
+            backbone_feat_dim = self.backbone.num_features
+            self.use_gem = False
+            with torch.no_grad():
+                dummy = torch.zeros(2, 3, image_size, image_size)
+                out = self.backbone.forward_features(dummy)
+                if out.dim() == 4:
+                    self.use_gem = True
+                elif out.dim() == 3:
+                    # ViT / Swin return (B, tokens, C); take mean over tokens
+                    self.use_gem = False
 
         if self.use_gem:
             self.pool = GeMPooling(p=3)
@@ -272,7 +373,10 @@ class ImprovedReIDModel(nn.Module):
         self.classifier = nn.Linear(feat_dim, num_classes)
 
     def forward_features(self, x):
-        feat = self.backbone.forward_features(x)
+        if hasattr(self.backbone, 'forward_features'):
+            feat = self.backbone.forward_features(x)
+        else:
+            feat = self.backbone(x)
         if self.use_gem:
             feat = self.pool(feat)
         elif feat.dim() == 3:

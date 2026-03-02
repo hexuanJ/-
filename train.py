@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
@@ -14,7 +15,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import ViTForJaguarReID, MegaDescriptorWrapper, ImprovedReIDModel
+from model import ViTForJaguarReID, MegaDescriptorWrapper, ImprovedReIDModel, ResNet50ReID
 from losses import CircleLoss, SubCenterArcFace, AdaFace
 
 
@@ -245,9 +246,12 @@ _ZERO = torch.tensor(0.0)
 def compute_loss(criterion, logits, labels, features):
     """Unified loss computation supporting both CombinedLoss and embedding losses."""
     if isinstance(criterion, (CircleLoss, SubCenterArcFace, AdaFace)):
-        # These losses work directly on embeddings and include their own classifier
-        result = criterion(features, labels)
-        return result, result, _ZERO
+        # Joint loss: metric loss (embedding-based) + cross-entropy (classifier logits)
+        # Equal 1:1 weighting follows standard practice in Re-ID (e.g., Bag of Tricks paper)
+        metric_loss = criterion(features, labels)
+        cls_loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
+        total = cls_loss + metric_loss
+        return total, cls_loss, metric_loss
     result = criterion(logits, labels, features)
     if isinstance(result, tuple):
         # CombinedLoss returns (total, cls, center)
@@ -350,8 +354,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Head 学习率（backbone 自动为 1/10）')
     parser.add_argument('--model', type=str, default='vit',
-                        choices=['vit', 'mega', 'improved'],
-                        help='模型选择: vit | mega | improved')
+                        choices=['vit', 'mega', 'improved', 'resnet50'],
+                        help='模型选择: vit | mega | improved | resnet50')
     parser.add_argument('--backbone', type=str,
                         default='swin_base_patch4_window12_384',
                         help='improved 模型使用的 timm backbone 名称')
@@ -397,6 +401,9 @@ def main():
             heads=16,
             mlp_dim=2048
         )
+    elif args.model == 'resnet50':
+        print('使用 ResNet50ReID (torchvision, Last Stride=1, GeM, BNNeck)')
+        model = ResNet50ReID(num_classes=num_classes, feat_dim=512)
     elif args.model == 'improved':
         print(f'使用预训练 backbone: {args.backbone}')
         model = ImprovedReIDModel(
@@ -432,17 +439,31 @@ def main():
     criterion = criterion.to(device)
 
     # 差分学习率：backbone 用小学习率，head 用大学习率
-    if args.model == 'improved' and hasattr(model, 'backbone'):
+    if args.model == 'resnet50':
+        backbone_params = model.get_backbone_parameters()
+        head_params = [p for p in model.parameters()
+                       if not any(p is bp for bp in backbone_params)]
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': args.lr * 0.1},
+            {'params': head_params, 'lr': args.lr},
+            {'params': criterion.parameters(), 'lr': args.lr},
+        ], weight_decay=0.01)
+        print(f'差分学习率: backbone={args.lr * 0.1:.2e}, head={args.lr:.2e}')
+    elif args.model == 'improved' and hasattr(model, 'backbone'):
         backbone_params = list(model.backbone.parameters())
         head_params = [p for p in model.parameters()
                        if not any(p is bp for bp in backbone_params)]
         optimizer = optim.AdamW([
             {'params': backbone_params, 'lr': args.lr * 0.1},
             {'params': head_params, 'lr': args.lr},
+            {'params': criterion.parameters(), 'lr': args.lr},
         ], weight_decay=0.01)
         print(f'差分学习率: backbone={args.lr * 0.1:.2e}, head={args.lr:.2e}')
     else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        optimizer = optim.AdamW(
+            list(model.parameters()) + list(criterion.parameters()),
+            lr=args.lr, weight_decay=0.01
+        )
 
     # Cosine Annealing with Linear Warmup
     warmup_epochs = max(5, args.epochs // 20)
