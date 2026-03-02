@@ -194,6 +194,106 @@ class ArcFace(nn.Module):
         return output
 
 
+class GeMPooling(nn.Module):
+    """Generalized Mean Pooling (GeM)"""
+
+    def __init__(self, p=3, eps=1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        return F.adaptive_avg_pool2d(
+            x.clamp(min=self.eps).pow(self.p),
+            1
+        ).pow(1.0 / self.p).flatten(1)
+
+
+class BNNeck(nn.Module):
+    """BNNeck from Bag of Tricks for Re-ID (2019)"""
+
+    def __init__(self, feat_dim):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(feat_dim)
+        self.bn.bias.requires_grad_(False)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class ImprovedReIDModel(nn.Module):
+    """Improved Re-ID model with pretrained backbone, GeM pooling, and BNNeck.
+
+    Supported backbones (timm names):
+      - 'swin_base_patch4_window12_384'
+      - 'convnext_base_384_in22ft1k'
+      - 'vit_base_patch16_384'
+      - 'tf_efficientnet_b4' (fallback for smaller GPU)
+    """
+
+    def __init__(self, num_classes=31,
+                 backbone_name='swin_base_patch4_window12_384',
+                 feat_dim=512,
+                 pretrained=True,
+                 image_size=384):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0
+        )
+
+        # Determine feature dimension from backbone
+        backbone_feat_dim = self.backbone.num_features
+
+        # Use GeM pooling if backbone outputs 4-D features, otherwise flatten
+        self.use_gem = False
+        with torch.no_grad():
+            dummy = torch.zeros(2, 3, image_size, image_size)
+            out = self.backbone.forward_features(dummy)
+            if out.dim() == 4:
+                self.use_gem = True
+            elif out.dim() == 3:
+                # ViT / Swin return (B, tokens, C); take mean over tokens
+                self.use_gem = False
+            # backbone_feat_dim already set above
+
+        if self.use_gem:
+            self.pool = GeMPooling(p=3)
+        else:
+            self.pool = None  # handled in forward
+
+        # Projection layer
+        self.proj = nn.Linear(backbone_feat_dim, feat_dim)
+
+        # BNNeck: before classifier, after L2-norm branch
+        self.bnneck = BNNeck(feat_dim)
+
+        # Classification head (used during training)
+        self.classifier = nn.Linear(feat_dim, num_classes)
+
+    def forward_features(self, x):
+        feat = self.backbone.forward_features(x)
+        if self.use_gem:
+            feat = self.pool(feat)
+        elif feat.dim() == 3:
+            feat = feat.mean(dim=1)
+        else:
+            feat = feat.flatten(1)
+        feat = self.proj(feat)
+        return feat
+
+    def forward(self, x, labels=None, return_features=False):
+        feat = self.forward_features(x)  # raw embedding
+
+        if return_features:
+            return F.normalize(feat, p=2, dim=1)
+
+        # BNNeck: L2-norm branch for retrieval, BN branch for classification
+        feat_bn = self.bnneck(feat)
+        logits = self.classifier(feat_bn)
+        return logits, feat
+
+
 # Alternative: Using pre-trained models
 class MegaDescriptorWrapper(nn.Module):
     """Wrapper for MegaDescriptor foundation model"""

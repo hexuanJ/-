@@ -7,13 +7,15 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 import os
+import math
 from pathlib import Path
 import argparse
 import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import ViTForJaguarReID, MegaDescriptorWrapper
+from model import ViTForJaguarReID, MegaDescriptorWrapper, ImprovedReIDModel
+from losses import CircleLoss, SubCenterArcFace, AdaFace
 
 
 class JaguarDataset(Dataset):
@@ -237,11 +239,25 @@ def create_data_loaders(data_dir, batch_size=16, val_split=0.2, use_weighted_sam
     return train_loader, val_loader, train_dataset.num_classes, train_dataset.label_to_idx
 
 
+_ZERO = torch.tensor(0.0)
+
+
+def compute_loss(criterion, logits, labels, features):
+    """Unified loss computation supporting both CombinedLoss and embedding losses."""
+    if isinstance(criterion, (CircleLoss, SubCenterArcFace, AdaFace)):
+        # These losses work directly on embeddings and include their own classifier
+        result = criterion(features, labels)
+        return result, result, _ZERO
+    result = criterion(logits, labels, features)
+    if isinstance(result, tuple):
+        # CombinedLoss returns (total, cls, center)
+        return result
+    return result, result, _ZERO
+
+
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch, scheduler=None):
     model.train()
     running_loss = 0.0
-    running_cls_loss = 0.0
-    running_center_loss = 0.0
     correct = 0
     total = 0
 
@@ -251,11 +267,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, schedule
 
         optimizer.zero_grad()
 
-        # Forward pass with labels for ArcFace
-        logits, features = model(images, labels=labels)
+        # Forward pass – all models accept optional 'labels' kwarg
+        import inspect
+        sig = inspect.signature(model.forward)
+        if 'labels' in sig.parameters:
+            logits, features = model(images, labels=labels)
+        else:
+            logits, features = model(images)
 
         # 计算损失
-        total_loss, cls_loss, center_loss = criterion(logits, labels, features)
+        total_loss, cls_loss, _ = compute_loss(criterion, logits, labels, features)
 
         # Backward pass
         total_loss.backward()
@@ -264,8 +285,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, schedule
 
         # 统计
         running_loss += total_loss.item()
-        running_cls_loss += cls_loss.item()
-        running_center_loss += center_loss.item()
         _, predicted = logits.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -273,7 +292,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, schedule
         if batch_idx % 20 == 0:
             print(f'  Batch [{batch_idx}/{len(dataloader)}] '
                   f'Loss: {total_loss.item():.4f} '
-                  f'(cls: {cls_loss.item():.4f}, center: {center_loss.item():.4f}) '
+                  f'(cls: {cls_loss.item():.4f}) '
                   f'Acc: {100. * correct / total:.2f}%')
 
     if scheduler:
@@ -291,24 +310,18 @@ def validate_epoch(model, dataloader, criterion, device):
     correct = 0
     total = 0
 
-    all_features = []
-    all_labels = []
-
     with torch.no_grad():
         for images, labels in dataloader:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
             logits, features = model(images)
-            total_loss, _, _ = criterion(logits, labels, features)
+            total_loss, _, _ = compute_loss(criterion, logits, labels, features)
 
             running_loss += total_loss.item()
             _, predicted = logits.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            all_features.append(features.cpu())
-            all_labels.append(labels.cpu())
 
     epoch_loss = running_loss / len(dataloader)
     epoch_acc = 100. * correct / total
@@ -334,8 +347,17 @@ def main():
                         help='数据目录 (包含 train.csv 和 train/ 文件夹)')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--model', type=str, default='vit', choices=['vit', 'mega'])
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Head 学习率（backbone 自动为 1/10）')
+    parser.add_argument('--model', type=str, default='vit',
+                        choices=['vit', 'mega', 'improved'],
+                        help='模型选择: vit | mega | improved')
+    parser.add_argument('--backbone', type=str,
+                        default='swin_base_patch4_window12_384',
+                        help='improved 模型使用的 timm backbone 名称')
+    parser.add_argument('--loss', type=str, default='combined',
+                        choices=['combined', 'circle', 'subcenter_arcface', 'adaface'],
+                        help='损失函数: combined(Focal+Center) | circle | subcenter_arcface | adaface')
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--val_split', type=float, default=0.2)
     parser.add_argument('--resume', type=str, default=None)
@@ -375,23 +397,63 @@ def main():
             heads=16,
             mlp_dim=2048
         )
+    elif args.model == 'improved':
+        print(f'使用预训练 backbone: {args.backbone}')
+        model = ImprovedReIDModel(
+            num_classes=num_classes,
+            backbone_name=args.backbone,
+            feat_dim=512,
+            pretrained=True
+        )
     else:
         model = MegaDescriptorWrapper(num_classes=num_classes, model_size='base')
 
     model = model.to(device)
 
     # 损失函数
-    criterion = CombinedLoss(
-        num_classes=num_classes,
-        feat_dim=512,
-        device=device,
-        use_focal=args.use_focal_loss
-    )
+    feat_dim = 512
+    if args.loss == 'circle':
+        criterion = CircleLoss(in_features=feat_dim, num_classes=num_classes)
+        print('使用 Circle Loss (CVPR 2020)')
+    elif args.loss == 'subcenter_arcface':
+        criterion = SubCenterArcFace(in_features=feat_dim, num_classes=num_classes)
+        print('使用 SubCenter ArcFace (ECCV 2020)')
+    elif args.loss == 'adaface':
+        criterion = AdaFace(in_features=feat_dim, num_classes=num_classes)
+        print('使用 AdaFace (CVPR 2022)')
+    else:
+        criterion = CombinedLoss(
+            num_classes=num_classes,
+            feat_dim=feat_dim,
+            device=device,
+            use_focal=args.use_focal_loss
+        )
+        print('使用 Focal + Center Loss (combined)')
     criterion = criterion.to(device)
 
-    # 优化器
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    # 差分学习率：backbone 用小学习率，head 用大学习率
+    if args.model == 'improved' and hasattr(model, 'backbone'):
+        backbone_params = list(model.backbone.parameters())
+        head_params = [p for p in model.parameters()
+                       if not any(p is bp for bp in backbone_params)]
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': args.lr * 0.1},
+            {'params': head_params, 'lr': args.lr},
+        ], weight_decay=0.01)
+        print(f'差分学习率: backbone={args.lr * 0.1:.2e}, head={args.lr:.2e}')
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # Cosine Annealing with Linear Warmup
+    warmup_epochs = max(5, args.epochs // 20)
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)
+        progress = float(epoch - warmup_epochs) / float(max(1, args.epochs - warmup_epochs))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # 恢复训练
     start_epoch = 0
@@ -431,7 +493,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_acc': best_acc,
                 'num_classes': num_classes,
-                'label_to_idx': label_to_idx  # 保存标签映射
+                'label_to_idx': label_to_idx
             }, save_path)
             print(f'✅ 保存最佳模型，准确率: {best_acc:.2f}%')
 

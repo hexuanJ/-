@@ -1,6 +1,6 @@
 # 🐆 美洲豹个体识别系统 (Jaguar Re-ID)
 
-基于深度学习的美洲豹个体重识别项目，使用预训练 ResNet50/ViT 进行迁移学习。
+基于深度学习的美洲豹个体重识别项目，支持预训练强 Backbone、现代 Loss 函数、Re-Ranking 后处理和多尺度 TTA 推理。
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
@@ -30,30 +30,40 @@
 ### 主要特点
 
 - ✅ 使用 ImageNet 预训练权重进行迁移学习
-- ✅ 支持 ResNet50 和 ViT 两种骨干网络
+- ✅ 支持多种强 Backbone：Swin Transformer、ConvNeXt、ViT（通过 timm）
+- ✅ GeM 广义均值池化 + BNNeck (Bag of Tricks)
+- ✅ 现代 Loss 函数：Circle Loss、SubCenter ArcFace、AdaFace
+- ✅ k-Reciprocal Re-Ranking 后处理提升 mAP
+- ✅ 多尺度 + 翻转 Test Time Augmentation (TTA)
+- ✅ 差分学习率 + Cosine Annealing with Warmup
 - ✅ 加权采样处理类别不平衡问题
-- ✅ 支持 GPU/CPU 训练和推理
 
 ### 技术架构
 
 ```
-输入图片 (224x224)
+输入图片 (384×384)
+    │
+    ▼
+┌─────────────────────────────────┐
+│  预训练 Backbone (timm)          │  ← Swin / ConvNeXt / ViT / EfficientNet
+│  + GeM Pooling                  │
+└─────────────────────────────────┘
     │
     ▼
 ┌─────────────────┐
-│  预训练 Backbone │  ← ResNet50 / ViT
-│  (特征提取)      │
+│  投影层 (512维)  │  ← FC
 └─────────────────┘
     │
     ▼
 ┌─────────────────┐
-│  特征层 (512维)  │  ← FC + BN + ReLU + Dropout
+│  BNNeck         │  ← BatchNorm (Bag of Tricks 2019)
 └─────────────────┘
     │
     ▼
-┌─────────────────┐
-│  分类器 (31类)   │  ← 美洲豹个体类别
-└─────────────────┘
+┌─────────────────┐         ┌─────────────────────┐
+│ L2归一化特征     │         │ 分类 Logits          │
+│ (检索/Re-Rank)  │         │ (训练时计算 Loss)     │
+└─────────────────┘         └─────────────────────┘
 ```
 
 ---
@@ -126,7 +136,7 @@ conda activate jaguar
 pip install torch torchvision
 pip install pandas numpy pillow
 pip install scikit-learn tqdm
-pip install timm  # 如果使用 ViT
+pip install timm einops  # backbone 和 ViT 组件
 ```
 ### 快捷安装
 ```bash
@@ -155,84 +165,107 @@ git clone https://github.com/your-username/jaguar-reid.git
 cd jaguar-reid
 ```
 
-### 2. 训练模型
+### 2. 训练模型（推荐：improved + AdaFace）
 
 ```bash
-python train.py --data_dir /path/to/dataset/train --batch_size 64 --epochs 50
+python train.py \
+    --data_dir /path/to/dataset/train \
+    --model improved \
+    --backbone swin_base_patch4_window12_384 \
+    --loss adaface \
+    --batch_size 16 \
+    --epochs 50
 ```
 
-### 3. 评估模型
+### 3. 评估模型（含 Re-Ranking + TTA）
 
 ```bash
-python evaluate.py --model_path checkpoints/best_model.pth --data_dir /path/to/dataset/train
+python evluate.py \
+    --model_path checkpoints/best_model.pth \
+    --data_dir /path/to/dataset/train \
+    --use_reranking \
+    --use_tta
 ```
 
-### 4. 生成提交文件
+### 4. 生成提交文件（含 Re-Ranking + TTA）
 
 ```bash
-python test.py --model_path checkpoints/best_model.pth --test_csv test.csv --test_img_dir /path/to/test
+python test.py \
+    --model_path checkpoints/best_model.pth \
+    --test_csv test.csv \
+    --test_img_dir /path/to/test \
+    --output submission.csv \
+    --use_reranking \
+    --use_tta
 ```
 
 ---
 
 ## 🏋️ 训练模型
 
-### 基本用法
+### 模型选项 (`--model`)
+
+| 选项 | 说明 |
+|------|------|
+| `vit` | 自建 ViT（从零训练，小数据集效果一般） |
+| `mega` | EfficientNet 预训练 backbone |
+| `improved` | **推荐**：timm 预训练强 backbone + GeM + BNNeck |
+
+### 推荐 backbone (`--backbone`，仅 `--model improved` 时有效)
+
+| backbone 名称 | 特点 |
+|--------------|------|
+| `swin_base_patch4_window12_384` | 强性能，需要较大显存 |
+| `convnext_base_384_in22ft1k` | 收敛快，效果强 |
+| `vit_base_patch16_384` | ViT 预训练版，效果好 |
+| `tf_efficientnet_b4` | 轻量，适合显存不足时 |
+
+### 损失函数选项 (`--loss`)
+
+| 选项 | 方法 | 推荐度 |
+|------|------|--------|
+| `combined` | Focal Loss + Center Loss（原始） | 普通 |
+| `circle` | Circle Loss (CVPR 2020) | 好 |
+| `subcenter_arcface` | SubCenter ArcFace (ECCV 2020) | 好 |
+| `adaface` | AdaFace (CVPR 2022) | **最推荐**，自适应 margin |
+
+### 完整训练示例
 
 ```bash
-python train.py --data_dir /tmp/dataset/train --batch_size 64 --epochs 50 --lr 0.001
-```
-
-### 完整参数说明
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--data_dir` | 必填 | 训练数据目录 |
-| `--batch_size` | 32 | 批次大小 |
-| `--epochs` | 50 | 训练轮数 |
-| `--lr` | 0.001 | 学习率 |
-| `--val_split` | 0.1 | 验证集比例 |
-| `--save_dir` | checkpoints | 模型保存目录 |
-
-### 训练示例
-
-```bash
-# 使用 ResNet50 (推荐)
+# 推荐配置：Swin + AdaFace + 差分学习率
 python train.py \
     --data_dir /tmp/dataset/train \
-    --batch_size 64 \
-    --epochs 50 \
-    --lr 0.005
+    --model improved \
+    --backbone swin_base_patch4_window12_384 \
+    --loss adaface \
+    --batch_size 16 \
+    --epochs 100 \
+    --lr 1e-3
 
-# 使用较小学习率防止过拟合
+# 轻量配置（显存不足时）
 python train.py \
     --data_dir /tmp/dataset/train \
+    --model improved \
+    --backbone tf_efficientnet_b4 \
+    --loss circle \
     --batch_size 32 \
-    --epochs 30 \
-    --lr 0.001
-```
-### 训练输出示例
-```
-✅ CUDA 可用
-   GPU: Tesla V100S-PCIE-32GB
-   显存: 31.73 GB
-使用设备: cuda
-加载数据集: 1895 张图片, 31 个类别
-类别分布: 最多 183 张, 最少 13 张
-训练集: 1705 张, 验证集: 190 张
+    --epochs 50 \
+    --lr 1e-3
 
-============================================================
-Epoch 1/50
-============================================================
-  Batch [0/26] Loss: 3.4841 Acc: 3.12%
-  Batch [10/26] Loss: 2.1532 Acc: 45.23%
-  Batch [20/26] Loss: 1.4521 Acc: 68.45%
-
-📊 Epoch 1 结果:
-   训练 - Loss: 1.8234, Acc: 52.34%
-   验证 - Loss: 1.2341, Acc: 65.26%
-✅ 保存最佳模型，准确率: 65.26%
+# 传统配置（保持向后兼容）
+python train.py \
+    --data_dir /tmp/dataset/train \
+    --model vit \
+    --loss combined \
+    --batch_size 16 \
+    --epochs 100
 ```
+
+### 训练策略说明
+
+- **差分学习率**：`--model improved` 时，backbone 学习率为 `lr × 0.1`，head 学习率为 `lr`
+- **Warmup + Cosine Annealing**：前 5% epoch 线性 warmup，之后 Cosine 衰减
+
 ---
 
 ## 📊 评估模型
@@ -240,7 +273,25 @@ Epoch 1/50
 ### 基本用法
 
 ```bash
-python evaluate.py --model_path checkpoints/best_model.pth --data_dir /tmp/dataset/train
+python evluate.py --model_path checkpoints/best_model.pth --data_dir /tmp/dataset/train
+```
+
+### 高级选项
+
+| 参数 | 说明 |
+|------|------|
+| `--use_reranking` | 启用 k-reciprocal Re-Ranking（推荐，免费提升 mAP） |
+| `--use_tta` | 启用多尺度+翻转 TTA（4x 推理，提升稳定性） |
+| `--device` | 推理设备：`cpu` 或 `cuda` |
+
+```bash
+# 完整评估（最高性能）
+python evluate.py \
+    --model_path checkpoints/best_model.pth \
+    --data_dir /tmp/dataset/train \
+    --use_reranking \
+    --use_tta \
+    --device cuda
 ```
 
 ### 评估指标
@@ -250,42 +301,31 @@ python evaluate.py --model_path checkpoints/best_model.pth --data_dir /tmp/datas
 - **Top-1 准确率**: 最相似样本是同一个体的比例
 - **Top-5 准确率**: 前5个最相似样本包含同一个体的比例
 
-### 输出示例
-
-```
-============================================================
-📊 评估结果
-============================================================
-  分类准确率: 81.05%
-  mAP: 0.9329 (93.29%)
-  Top-1 检索准确率: 92.11%
-  Top-5 检索准确率: 94.21%
-============================================================
-```
-
 ---
 
 ## 📤 生成提交文件
-
-### 基本用法
 
 ```bash
 python test.py \
     --model_path checkpoints/best_model.pth \
     --test_csv test.csv \
     --test_img_dir /tmp/dataset/test \
-    --output submission.csv
+    --output submission.csv \
+    --use_reranking \
+    --use_tta
 ```
 
-### 输出格式
+### 参数说明
 
-```csv
-row_id,similarity
-0,0.8234
-1,0.1234
-2,0.9521
-...
-```
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model_path` | best_model.pth | 模型权重路径 |
+| `--test_csv` | 必填 | 测试配对 CSV |
+| `--test_img_dir` | 必填 | 测试图片目录 |
+| `--output` | submission.csv | 输出文件 |
+| `--use_reranking` | False | 启用 Re-Ranking |
+| `--use_tta` | False | 启用 TTA |
+| `--device` | cpu | 推理设备 |
 
 ---
 
@@ -295,15 +335,16 @@ row_id,similarity
 ```
 jaguar-reid/
 ├── README.md              # 项目说明文档
+├── requirements.txt       # 依赖列表
+├── model.py               # 模型定义（ViT / MegaDescriptor / ImprovedReIDModel）
+├── losses.py              # 现代 Loss（CircleLoss / SubCenterArcFace / AdaFace）
+├── reranking.py           # k-Reciprocal Re-Ranking (CVPR 2017)
 ├── train.py               # 训练脚本
-├── test.py                # 测试脚本
-├── evaluate.py            # 评估脚本
-├── model.py               # 模型定义
+├── test.py                # 测试脚本（生成提交文件）
+├── evluate.py             # 评估脚本（mAP / Top-1 / Top-5）
+├── shangchuan.py          # 数据上传工具
 ├── checkpoints/           # 模型保存目录
-│   └── best_model.pth     # 最佳模型权重
-├── data/                  # 数据目录
-│   ├── train/
-│   └── test/
+│   └── best_model.pth
 └── submission.csv         # 提交文件
 ```
 
@@ -311,28 +352,24 @@ jaguar-reid/
 
 ## 🔍 常见问题
 
-### Q1: 训练时 Acc 一直是 0%？
+### Q1: 显存不足怎么办？
 
-**原因**: 可能是损失函数配置问题（如 ArcFace 参数不当）
-
-**解决**: 使用简单的交叉熵损失：
-```python
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+使用更小的 backbone 或减小 batch size：
+```bash
+python train.py \
+    --data_dir /tmp/dataset/train \
+    --model improved \
+    --backbone tf_efficientnet_b4 \
+    --batch_size 8
 ```
 
-### Q2: GPU 利用率显示 0%？
+### Q2: Re-Ranking 很慢怎么办？
 
-**原因**: `nvidia-smi` 显示的是瞬时值，数据加载时 GPU 空闲
+Re-Ranking 时间复杂度为 O(N²)，建议只在测试时开启。在 CPU 上 200 张图片约需几秒。
 
-**解决**: 查看显存占用，有占用说明正在使用 GPU
+### Q3: TTA 对结果影响大吗？
 
-### Q3: 过拟合怎么办？
-
-**解决方案**:
-- 使用早停（Early Stopping）
-- 增加数据增强
-- 减小学习率
-- 增加 Dropout
+TTA 会进行 4× 推理（原图 + 翻转 + 两种缩放），通常可以提升 1-2% mAP。
 
 ### Q4: 路径错误 FileNotFoundError？
 
@@ -354,6 +391,10 @@ head /tmp/dataset/train/train.csv
 
 - [PyTorch](https://pytorch.org/)
 - [timm](https://github.com/huggingface/pytorch-image-models)
+- [Circle Loss (CVPR 2020)](https://arxiv.org/abs/2002.10857)
+- [SubCenter ArcFace (ECCV 2020)](https://arxiv.org/abs/2004.01159)
+- [AdaFace (CVPR 2022)](https://arxiv.org/abs/2204.00964)
+- [Re-Ranking (CVPR 2017)](https://arxiv.org/abs/1701.08398)
 - [OpenI 平台](https://openi.pcl.ac.cn/)
 
 ---
